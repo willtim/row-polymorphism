@@ -1,13 +1,10 @@
 ----------------------------------------------------------------------
--- Polymorphic Extensible Records with Scoped labels
---
--- See "Extensible Records with Scoped labels" by Daan Leijen
--- Based on code from "Algorithm W Step-by-Step" by Martin Grabmuller
+-- Polymorphic Extensible Records and Variants with Constrained Rows
 ----------------------------------------------------------------------
 
-{-# LANGUAGE TupleSections, OverloadedStrings #-}
+{-# LANGUAGE TupleSections, OverloadedStrings, ViewPatterns #-}
 
-module AlgorithmW_Records where
+module AlgorithmW_ConstrainedRows where
 
 import qualified Data.List as L
 import qualified Data.Map as M
@@ -40,7 +37,7 @@ data Prim
     deriving (Eq, Ord)
 
 data Type
-  = TVar Name
+  = TVar TyVar
   | TInt
   | TBool
   | TFun Type Type
@@ -49,22 +46,32 @@ data Type
   | TRowExtend Label Type Type
     deriving (Eq, Ord)
 
-data Scheme = Scheme [Name] Type
+data TyVar = TyVar
+  { tyvarName       :: Name
+  , tyvarConstraint :: Constraint
+  } deriving (Eq, Ord)
+
+data Constraint
+  = CRowLacks (S.Set Label)
+  | CNone
+    deriving (Eq, Ord)
+
+data Scheme = Scheme [TyVar] Type
 
 class Types a where
-  ftv :: a -> S.Set Name -- ^ free type variables
+  ftv :: a -> S.Set TyVar -- ^ free type variables
   apply :: Subst -> a -> a
 
 instance Types Type where
-  ftv (TVar n) = S.singleton n
+  ftv (TVar v) = S.singleton v
   ftv TInt = S.empty
   ftv TBool = S.empty
   ftv (TFun t1 t2) = ftv t1 `S.union` ftv t2
   ftv (TRecord t) = ftv t
   ftv TRowEmpty = S.empty
   ftv (TRowExtend l t r) = ftv r `S.union` ftv t
-  apply s (TVar n) = case M.lookup n s of
-                       Nothing -> TVar n
+  apply s (TVar v) = case M.lookup v s of
+                       Nothing -> TVar v
                        Just t -> t
   apply s (TFun t1 t2) = TFun (apply s t1) (apply s t2)
   apply s (TRecord t) = TRecord (apply s t)
@@ -79,11 +86,14 @@ instance Types a => Types [a] where
   apply s = map (apply s)
   ftv l = foldr S.union S.empty (map ftv l)
 
-type Subst = M.Map Name Type
+type Subst = M.Map TyVar Type
 
 nullSubst :: Subst
 nullSubst = M.empty
 
+-- | apply s1 and then s2
+-- NB: order is very important, there were bugs in the original
+-- "Algorithm W Step-by-Step" paper related to substitution composition
 composeSubst :: Subst -> Subst -> Subst
 composeSubst s1 s2 = (M.map (apply s1) s2) `M.union` s1
 
@@ -96,10 +106,10 @@ instance Types TypeEnv where
   ftv (TypeEnv env) = ftv (M.elems env)
   apply s (TypeEnv env) = TypeEnv (M.map (apply s) env)
 
--- | generalize abstracts a type over all type variables which are free
+-- | generalise abstracts a type over all type variables which are free
 -- in the type but not free in the given type environment.
-generalize :: TypeEnv -> Type -> Scheme
-generalize env t = Scheme vars t
+generalise :: TypeEnv -> Type -> Scheme
+generalise env t = Scheme vars t
   where
     vars = S.toList ((ftv t) S.\\ (ftv env))
 
@@ -118,16 +128,20 @@ runTI t = do
 initTIState = TIState {tiSupply = 0, tiSubst = M.empty }
 
 newTyVar :: Char -> TI Type
-newTyVar prefix = do
+newTyVar = newTyVarWith CNone
+
+newTyVarWith :: Constraint -> Char -> TI Type
+newTyVarWith c prefix = do
   s <- get
   put s {tiSupply = tiSupply s + 1 }
-  return (TVar $ prefix : show (tiSupply s))
+  let name = prefix : show (tiSupply s)
+  return (TVar $ TyVar name c)
 
 -- | The instantiation function replaces all bound type variables in a
 -- type scheme with fresh type variables.
 instantiate :: Scheme -> TI Type
 instantiate (Scheme vars t) = do
-  nvars <- mapM (\(p:_) -> newTyVar p) vars
+  nvars <- mapM (\(TyVar (p:_) c) -> newTyVarWith c p) vars
   let s = M.fromList (zip vars nvars)
   return $ apply s t
 
@@ -136,8 +150,9 @@ unify (TFun l r) (TFun l' r') = do
   s1 <- unify l l'
   s2 <- unify (apply s1 r) (apply s1 r')
   return $ s2 `composeSubst` s1
-unify (TVar u) t = varBind u t
-unify t (TVar u) = varBind u t
+unify (TVar u) (TVar v) = unionConstraints u v
+unify (TVar v) t = varBind v t
+unify t (TVar v) = varBind v t
 unify TInt TInt = return nullSubst
 unify TBool TBool = return nullSubst
 unify (TRecord row1) (TRecord row2) = unify row1 row2
@@ -154,23 +169,54 @@ unify (TRowExtend label1 fieldTy1 rowTail1) row2@TRowExtend{} = do
       return $ theta3 `composeSubst` s
 unify t1 t2 = throwError $ "types do not unify: " ++ show t1 ++ " vs. " ++ show t2
 
-varBind :: String -> Type -> TI Subst
+unionConstraints :: TyVar -> TyVar -> TI Subst
+unionConstraints u v
+  | u == v    = return nullSubst
+  | CNone <- tyvarConstraint u
+  , CNone <- tyvarConstraint v = return $ M.singleton u (TVar v)
+  | otherwise = do
+      let c = CRowLacks $ (labelsFromTyVar u) `S.union` (labelsFromTyVar v)
+      r <- newTyVarWith c 'r'
+      return $ M.fromList [ (u, r), (v, r) ]
+
+varBind :: TyVar -> Type -> TI Subst
 varBind u t
-  | t == TVar u        = return nullSubst
   | u `S.member` ftv t = throwError $ "occur check fails: " ++ " vs. " ++ show t
-  | otherwise          = return $ M.singleton u t
+  | otherwise          = case tyvarConstraint u of
+                           CNone        -> return $ M.singleton u t
+                           CRowLacks ls -> constrainRow ls u t
+
+constrainRow :: S.Set Label -> TyVar -> Type -> TI Subst
+constrainRow ls u t
+  = case S.toList (ls `S.intersection` ls') of
+      []     -> case mv of
+                  Nothing -> return s1
+                  Just r1 -> do
+                    let c = CRowLacks $ ls `S.union` (labelsFromTyVar r1)
+                    r2 <- newTyVarWith c 'r'
+                    let s2 = M.singleton r1 r2
+                    return $ s1 `composeSubst` s2
+      labels -> throwError $ "repeated labels: " ++ show labels
+  where
+    (S.fromList . map fst -> ls', mv) = toList t
+    s1                                = M.singleton u t
 
 rewriteRow :: Type -> Label -> TI (Type, Type, Subst)
 rewriteRow TRowEmpty newLabel = throwError $ "label " ++ newLabel ++ " cannot be inserted"
 rewriteRow (TRowExtend label fieldTy rowTail) newLabel
   | newLabel == label     = return (fieldTy, rowTail, nullSubst) -- ^ nothing to do
-  | TVar alpha <- rowTail = do
-      beta  <- newTyVar 'r'
-      gamma <- newTyVar 'a'
-      return ( gamma
-             , TRowExtend label fieldTy beta
-             , M.singleton alpha $ TRowExtend newLabel gamma beta
-             )
+  | TVar alpha <- rowTail
+  , ls <- labelsFromTyVar alpha
+    = case newLabel `S.notMember` ls of
+        True  -> do
+          let c = CRowLacks $ S.insert newLabel ls
+          beta  <- newTyVarWith c 'r'
+          gamma <- newTyVar 'a'
+          return ( gamma
+                 , TRowExtend label fieldTy beta
+                 , M.singleton alpha $ TRowExtend newLabel gamma beta
+                 )
+        False -> throwError $ "repeated label: " ++ show newLabel
   | otherwise   = do
       (fieldTy', rowTail', s) <- rewriteRow rowTail newLabel
       return ( fieldTy'
@@ -203,7 +249,7 @@ ti env (EApp e1 e2) = do
 ti env (ELet x e1 e2) = do
   (s1, t1) <- ti env e1
   let TypeEnv env' = remove env x
-      scheme = generalize (apply s1 env) t1
+      scheme = generalise (apply s1 env) t1
       env''  = TypeEnv (M.insert x scheme env')
   (s2, t2) <- ti (apply s1 env'') e2
   return (s2 `composeSubst` s1, t2)
@@ -215,15 +261,15 @@ tiPrim p = case p of
   RecordEmpty            -> return $ TRecord TRowEmpty
   (RecordSelect label)   -> do
     a <- newTyVar 'a'
-    r <- newTyVar 'r'
+    r <- newTyVarWith (lacks label) 'r'
     return $ TFun (TRecord $ TRowExtend label a r) a
   (RecordExtend label)   -> do
     a <- newTyVar 'a'
-    r <- newTyVar 'r'
+    r <- newTyVarWith (lacks label) 'r'
     return $ TFun a (TFun (TRecord r) (TRecord $ TRowExtend label a r))
   (RecordRestrict label) -> do
     a <- newTyVar 'a'
-    r <- newTyVar 'r'
+    r <- newTyVarWith (lacks label) 'r'
     return $ TFun (TRecord $ TRowExtend label a r) (TRecord r)
 
 typeInference :: M.Map String Scheme -> Exp -> TI Type
@@ -231,11 +277,19 @@ typeInference env e = do
   (s, t) <- ti (TypeEnv env) e
   return $ apply s t
 
-toList :: Type -> ([(Label, Type)], Maybe Name)
-toList (TVar r)           = ([], Just r)
+--  | decompose a row-type into its constituent parts
+toList :: Type -> ([(Label, Type)], Maybe TyVar)
+toList (TVar v)           = ([], Just v)
 toList TRowEmpty          = ([], Nothing)
 toList (TRowExtend l t r) = let (ls, mv) = toList r
                             in ((l, t):ls, mv)
+lacks :: Label -> Constraint
+lacks = CRowLacks . S.singleton
+
+labelsFromTyVar :: TyVar -> S.Set Label
+labelsFromTyVar v = case tyvarConstraint v of
+                      CNone        -> S.empty
+                      CRowLacks ls -> ls
 
 
 ----------------------------------------------------------------------
@@ -252,7 +306,7 @@ test e = do
   (res,_) <- runTI $ typeInference M.empty e
   case res of
     Left err -> putStrLn $ "error: " ++ err
-    Right t  -> putStrLn $ show e ++ " :: " ++ show t
+    Right t  -> putStrLn $ show e ++ " :: " ++ show (generalise (TypeEnv M.empty) t)
 
 main :: IO ()
 main = do
@@ -270,7 +324,7 @@ instance Show Type where
   showsPrec _ x = shows $ ppType x
 
 ppType :: Type -> Doc
-ppType (TVar n)    = text n
+ppType (TVar v)    = text $ tyvarName v
 ppType TInt        = "Int"
 ppType TBool       = "Bool"
 ppType (TFun t s)  = ppParenType t <+> "->" <+> ppType s
@@ -278,7 +332,7 @@ ppType (TRecord r) = braces $ (hsep $ punctuate comma $ map ppEntry ls)
                               <> maybe empty ppRowVar mv
   where
     (ls, mv)       = toList r
-    ppRowVar r     = space <> "|" <+> text r
+    ppRowVar r     = space <> "|" <+> text (tyvarName r)
     ppEntry (l, t) = text l <+> "=" <+> ppType t
 ppType _ = error "Unexpected type"
 
@@ -324,4 +378,14 @@ instance Show Scheme where
 
 ppScheme :: Scheme -> Doc
 ppScheme (Scheme vars t) =
-  "forall" <+> hcat (punctuate comma $ map text vars) <> "." <+> ppType t
+  "forall" <+> hcat (punctuate space $ map (text . tyvarName) vars) <> "."
+           <+> parens (hcat $ punctuate comma $ concatMap ppConstraint vars) <+> "=>"
+           <+> ppType t
+  where
+    ppConstraint :: TyVar -> [Doc]
+    ppConstraint (TyVar n c) =
+      case c of
+        CNone -> []
+        CRowLacks (S.toList -> ls)
+          | null ls   -> []
+          | otherwise -> [hcat (punctuate "\\" $ text n : map text ls)]
