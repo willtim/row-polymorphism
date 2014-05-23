@@ -14,6 +14,7 @@ import qualified Data.Map as M
 import qualified Data.Set as S
 
 import Control.Applicative ((<$>))
+import Control.Arrow (first)
 import Control.Monad.Error
 import Control.Monad.Reader
 import Control.Monad.State
@@ -60,13 +61,15 @@ data Type
 
 data TyVar = TyVar
   { tyvarName       :: Name
+  , tyvarKind       :: Kind
   , tyvarConstraint :: Constraint
   } deriving (Eq, Ord)
 
-data Constraint
-  = CRowLacks (S.Set Label)
-  | CNone
-    deriving (Eq, Ord)
+-- | row type variables may have constraints
+data Kind = Star | Row deriving (Eq, Ord)
+
+-- | labels the associated tyvar must lack, for types of kind row
+type Constraint = S.Set Label
 
 data Scheme = Scheme [TyVar] Type
 
@@ -142,25 +145,32 @@ runTI t = do
 initTIState = TIState {tiSupply = 0, tiSubst = M.empty }
 
 newTyVar :: Char -> TI Type
-newTyVar = newTyVarWith CNone
+newTyVar = newTyVarWith Star none
 
-newTyVarWith :: Constraint -> Char -> TI Type
-newTyVarWith c prefix = do
+newTyVarWith :: Kind -> Constraint -> Char -> TI Type
+newTyVarWith k c prefix = do
   s <- get
   put s {tiSupply = tiSupply s + 1 }
   let name = prefix : show (tiSupply s)
-  return (TVar $ TyVar name c)
+  return (TVar $ TyVar name k c)
+
+newEffect :: TI Effect
+newEffect = newEffectWith none
+
+newEffectWith :: Constraint -> TI Effect
+newEffectWith c = newTyVarWith Row c 'e'
+
 
 -- | The instantiation function replaces all bound type variables in a
 -- type scheme with fresh type variables.
 instantiate :: Scheme -> TI Type
 instantiate (Scheme vars t) = do
-  nvars <- mapM (\(TyVar (p:_) c) -> newTyVarWith c p) vars
+  nvars <- mapM (\(TyVar (p:_) k c) -> newTyVarWith k c p) vars
   let s = M.fromList (zip vars nvars)
   return $ apply s t
 
 unify :: Type -> Type -> TI Subst
-unify (TFun l eff r) (TFun l' eff' r') = do -- TODO check
+unify (TFun l eff r) (TFun l' eff' r') = do
   s1 <- unify l l'
   s2 <- unify (apply s1 eff) (apply s1 eff')
   let s = s2 `composeSubst` s1
@@ -186,60 +196,56 @@ unify (TRowExtend label1 fieldTy1 rowTail1) row2@TRowExtend{} = do
       return $ theta3 `composeSubst` s
 unify t1 t2 = throwError $ "types do not unify: " ++ show t1 ++ " vs. " ++ show t2
 
+-- | in order to unify two type variables, we must union any lacks constraints
 unionConstraints :: TyVar -> TyVar -> TI Subst
 unionConstraints u v
   | u == v    = return nullSubst
-  | CNone <- tyvarConstraint u
-  , CNone <- tyvarConstraint v = return $ M.singleton u (TVar v)
-  | otherwise = do
-      let c = CRowLacks $ (labelsFromTyVar u) `S.union` (labelsFromTyVar v)
-      r <- newTyVarWith c 'r'
-      return $ M.fromList [ (u, r), (v, r) ]
+  | otherwise =
+      case (tyvarKind u, tyvarKind v) of
+       (Star, Star) -> return $ M.singleton u (TVar v)
+       (Row,  Row)  -> do
+         let c = (tyvarConstraint u) `S.union` (tyvarConstraint v)
+         r <- newTyVarWith Row c 'e'
+         return $ M.fromList [ (u, r), (v, r) ]
+       _            -> throwError "kind mismatch!"
 
 varBind :: TyVar -> Type -> TI Subst
 varBind u t
   | u `S.member` ftv t = throwError $ "occur check fails: " ++ " vs. " ++ show t
-  | otherwise          = case tyvarConstraint u of
-                           CNone        -> return $ M.singleton u t
-                           CRowLacks ls -> constrainRow ls u t
+  | otherwise          = case tyvarKind u of
+                           Star -> return $ M.singleton u t
+                           Row  -> varBindRow u t
 
-constrainRow :: S.Set Label -> TyVar -> Type -> TI Subst
-constrainRow ls u t
+-- | bind the row tyvar to the row type, as long as the row type does not
+-- contain the labels in the tyvar lacks constraint; and propagate these
+-- label constraints to the row variable in the row tail, if there is one.
+varBindRow :: TyVar -> Type -> TI Subst
+varBindRow u t
   = case S.toList (ls `S.intersection` ls') of
-      []     -> case mv of
-                  Nothing -> return s1
-                  Just r1 -> do
-                    let c = CRowLacks $ ls `S.union` (labelsFromTyVar r1)
-                    r2 <- newTyVarWith c 'r'
-                    let s2 = M.singleton r1 r2
-                    return $ s1 `composeSubst` s2
-      labels -> throwError $ "illegal effect(s): " ++ show labels
+      [] | Nothing <- mv -> return s1
+         | Just r1 <- mv -> do
+             let c = ls `S.union` (tyvarConstraint r1)
+             r2 <- newTyVarWith Row c 'e'
+             let s2 = M.singleton r1 r2
+             return $ s1 `composeSubst` s2
+      labels             -> throwError $ "illegal label(s): " ++ show labels
   where
-    (S.fromList . map fst -> ls', mv) = toList t
-    s1                                = M.singleton u t
+    ls        = tyvarConstraint u
+    (ls', mv) = first (S.fromList . map fst) $ toList t
+    s1        = M.singleton u t
 
 rewriteRow :: Type -> Label -> TI (Type, Type, Subst)
-rewriteRow TRowEmpty newLabel = throwError $ "effect " ++ newLabel ++ " cannot be inserted"
+rewriteRow TRowEmpty newLabel = throwError $ "label " ++ newLabel ++ " cannot be inserted"
 rewriteRow (TRowExtend label fieldTy rowTail) newLabel
   | newLabel == label     = return (fieldTy, rowTail, nullSubst) -- ^ nothing to do
-  | TVar alpha <- rowTail
-  , ls <- labelsFromTyVar alpha
-    = case newLabel `S.notMember` ls of
-        True  -> do
-          let c = CRowLacks $ S.insert newLabel ls
-          beta  <- newTyVarWith c 'r'
-          gamma <- newTyVar 'a'
-          return ( gamma
-                 , TRowExtend label fieldTy beta
-                 , M.singleton alpha $ TRowExtend newLabel gamma beta
-                 )
-        False -> throwError $ "illegal effect(s): " ++ show newLabel
+  | TVar alpha <- rowTail = do
+      beta  <- newTyVarWith Row (lacks newLabel) 'e'
+      gamma <- newTyVar 'a'
+      s     <- varBindRow alpha $ TRowExtend newLabel gamma beta
+      return (gamma, apply s $ TRowExtend label fieldTy beta, s)
   | otherwise   = do
       (fieldTy', rowTail', s) <- rewriteRow rowTail newLabel
-      return ( fieldTy'
-             , TRowExtend label fieldTy rowTail'
-             , s
-             )
+      return (fieldTy', TRowExtend label fieldTy rowTail', s)
 rewriteRow ty _ = error $ "Unexpected type: " ++ show ty
 
 -- | type-inference
@@ -248,19 +254,19 @@ ti (TypeEnv env) (EVar n) =
   case M.lookup n env of
     Nothing -> throwError $ "unbound variable: "++n
     Just sigma -> do
-      t <- instantiate sigma
-      eff <- newTyVar 'e'
+      t   <- instantiate sigma
+      eff <- newEffect
       return (nullSubst, t, eff)
 ti env (EPrim prim) = do
-  t <- tiPrim prim
-  eff <- newTyVar 'e'
+  t   <- tiPrim prim
+  eff <- newEffect
   return (nullSubst, t, eff)
 ti env (EAbs n e) = do
   tv <- newTyVar 'a'
   let TypeEnv env' = remove env n
       env'' = TypeEnv (env' `M.union` (M.singleton n (Scheme [] tv)))
   (s1, t1, eff2) <- ti env'' e
-  eff <- newTyVar 'e'
+  eff <- newEffect
   return (s1, TFun (apply s1 tv) eff2 t1, eff)
 ti env (EApp e1 e2) = do
   (s1, t1, eff1) <- ti env e1
@@ -272,7 +278,7 @@ ti env (EApp e1 e2) = do
          , apply (s4 `composeSubst` s3) tv
          , apply (s4 `composeSubst` s3) eff2
          )
-ti env (ELet x e1 e2) = do -- TODO
+ti env (ELet x e1 e2) = do
   (s1, t1, eff1) <- ti env e1
   s2 <- unify eff1 emptyEff
   let TypeEnv env' = remove env x
@@ -288,32 +294,32 @@ tiPrim p = case p of
   (Bool _)               -> return TBool
   (Str _)                -> return TStr
   Add                    -> do
-    eff1 <- newTyVar 'e'
-    eff2 <- newTyVar 'e'
+    eff1 <- newEffect
+    eff2 <- newEffect
     return $ TFun TInt eff1 (TFun TInt eff2 TInt)
   Div                    -> do
-    eff1 <- newTyVar 'e'
-    eff2 <- TRowExtend "par" TUnit <$> newTyVarWith (lacks "par") 'e'
+    eff1 <- newEffect
+    eff2 <- TRowExtend "par" TUnit <$> newEffectWith (lacks "par")
     return $ TFun TInt eff1 (TFun TInt eff2 TInt)
   Catch                  -> do
     t1   <- newTyVar 'a'
-    eff1 <- newTyVar 'e'
-    eff2 <- newTyVarWith (lacks "par") 'e'
+    eff1 <- newEffect
+    eff2 <- newEffectWith (lacks "par")
     let action  = TFun TUnit (TRowExtend "par" TUnit eff2) t1
         handler = TFun TUnit eff2 t1
     return $ TFun action eff1 (TFun handler eff2 t1)
   Total                  -> do
     t1   <- newTyVar 'a'
-    eff1 <- newTyVarWith (lacks "par") 'e'
+    eff1 <- newEffectWith (lacks "par")
     return $ TFun t1 eff1 t1
   Print                  -> do
     t1   <- newTyVar 'a'
-    eff1 <- newTyVar 'e'
-    eff2 <- TRowExtend "io" TUnit <$> newTyVarWith (lacks "io") 'e'
+    eff1 <- newEffect
+    eff2 <- TRowExtend "io" TUnit <$> newEffectWith (lacks "io")
     return $ TFun TStr eff1 (TFun t1 eff2 t1)
   Pure                   -> do
     t1   <- newTyVar 'a'
-    eff1 <- newTyVarWith (lacks "io") 'e'
+    eff1 <- newEffectWith (lacks "io")
     return $ TFun t1 eff1 t1
 
 
@@ -329,12 +335,10 @@ toList TRowEmpty          = ([], Nothing)
 toList (TRowExtend l t r) = let (ls, mv) = toList r
                             in ((l, t):ls, mv)
 lacks :: Label -> Constraint
-lacks = CRowLacks . S.singleton
+lacks = S.singleton
 
-labelsFromTyVar :: TyVar -> S.Set Label
-labelsFromTyVar v = case tyvarConstraint v of
-                      CNone        -> S.empty
-                      CRowLacks ls -> ls
+none :: Constraint
+none = S.empty
 
 
 ----------------------------------------------------------------------
@@ -349,6 +353,7 @@ e4 = EAbs "x" (EApp (EApp (EPrim Print) (EPrim $ Str "x is ")) (EVar "x"))
 e5 = ELet "f" e2 (EApp (EPrim Pure) (EApp (EVar "f") (EPrim $ Int 0)))
 e6 = ELet "f" e2 (EApp (EPrim Total) (EApp (EVar "f") (EPrim $ Int 42)))
 e7 = ELet "f" e4 (EApp (EPrim Pure) (EApp (EVar "f") (EPrim $ Int 42)))
+e8 = ELet "f" e2 (EApp (EVar "f") (EApp (EVar "f") (EPrim $ Int 0)))
 
 test :: Exp -> IO ()
 test e = do
@@ -359,7 +364,7 @@ test e = do
 
 main :: IO ()
 main = do
-  mapM test [ e1, e2, e3, e4, e5, e6, e7 ]
+  mapM test [ e1, e2, e3, e4, e5, e6, e7, e8 ]
   return ()
 
 
@@ -446,9 +451,10 @@ ppScheme (Scheme vars t) =
            <+> ppType t
   where
     ppConstraint :: TyVar -> [Doc]
-    ppConstraint (TyVar n c) =
-      case c of
-        CNone -> []
-        CRowLacks (S.toList -> ls)
-          | null ls   -> []
-          | otherwise -> [hcat (punctuate "\\" $ text n : map text ls)]
+    ppConstraint (TyVar n k c) =
+      case k of
+        Star            -> []
+        Row | null ls   -> []
+            | otherwise -> [hcat (punctuate "\\" $ text n : map text ls)]
+      where
+        ls = S.toList c

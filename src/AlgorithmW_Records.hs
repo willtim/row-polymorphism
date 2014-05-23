@@ -275,10 +275,11 @@ ppType TInt        = "Int"
 ppType TBool       = "Bool"
 ppType (TFun t s)  = ppParenType t <+> "->" <+> ppType s
 ppType (TRecord r) = braces $ (hsep $ punctuate comma $ map ppEntry ls)
-                              <> maybe empty ppRowVar mv
+                              <> maybe empty (ppRowTail ls) mv
   where
     (ls, mv)       = toList r
-    ppRowVar r     = space <> "|" <+> text r
+    ppRowTail [] r = text r
+    ppRowTail _  r = space <> "|" <+> text r
     ppEntry (l, t) = text l <+> "=" <+> ppType t
 ppType _ = error "Unexpected type"
 
