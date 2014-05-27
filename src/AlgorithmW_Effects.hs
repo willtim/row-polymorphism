@@ -187,7 +187,7 @@ unify TRowEmpty TRowEmpty = return nullSubst
 unify (TRowExtend label1 fieldTy1 rowTail1) row2@TRowExtend{} = do
   (fieldTy2, rowTail2, theta1) <- rewriteRow row2 label1
   -- ^ apply side-condition to ensure termination
-  case snd $ toList rowTail2 of
+  case snd $ toList rowTail1 of
     Just tv | M.member tv theta1 -> throwError "recursive row type"
     _ -> do
       theta2 <- unify (apply theta1 fieldTy1) (apply theta1 fieldTy2)

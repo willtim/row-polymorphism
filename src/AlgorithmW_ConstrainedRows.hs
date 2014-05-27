@@ -32,10 +32,14 @@ data Prim
   = Int Integer
   | Bool Bool
   | Add
+  | Cond
+  | RecordEmpty
   | RecordSelect Label
   | RecordExtend Label
   | RecordRestrict Label
-  | RecordEmpty
+  | VariantInject Label
+  | VariantEmbed Label
+  | VariantElim Label
     deriving (Eq, Ord)
 
 data Type
@@ -44,6 +48,7 @@ data Type
   | TBool
   | TFun Type Type
   | TRecord Type
+  | TVariant Type
   | TRowEmpty
   | TRowExtend Label Type Type
     deriving (Eq, Ord)
@@ -164,7 +169,7 @@ unify TRowEmpty TRowEmpty = return nullSubst
 unify (TRowExtend label1 fieldTy1 rowTail1) row2@TRowExtend{} = do
   (fieldTy2, rowTail2, theta1) <- rewriteRow row2 label1
   -- ^ apply side-condition to ensure termination
-  case snd $ toList rowTail2 of
+  case snd $ toList rowTail1 of
     Just tv | M.member tv theta1 -> throwError "recursive row type"
     _ -> do
       theta2 <- unify (apply theta1 fieldTy1) (apply theta1 fieldTy2)
@@ -191,9 +196,9 @@ varBind u t
   | u `S.member` ftv t = throwError $ "occur check fails: " ++ " vs. " ++ show t
   | otherwise          = case tyvarKind u of
                            Star -> return $ M.singleton u t
-                           Row  -> constrainRow u t
+                           Row  -> varBindRow u t
 
--- | bind row the tyvar to the row type, as long as the row type does not
+-- | bind the row tyvar to the row type, as long as the row type does not
 -- contain the labels in the tyvar lacks constraint; and propagate these
 -- label constraints to the row variable in the row tail, if there is one.
 varBindRow :: TyVar -> Type -> TI Subst
@@ -259,6 +264,9 @@ tiPrim p = case p of
   (Int _)                -> return TInt
   (Bool _)               -> return TBool
   Add                    -> return $ TFun TInt (TFun TInt TInt)
+  Cond                   -> do
+    a <- newTyVar 'a'
+    return $ TFun TBool (TFun a (TFun a a))
   RecordEmpty            -> return $ TRecord TRowEmpty
   (RecordSelect label)   -> do
     a <- newTyVar 'a'
@@ -272,6 +280,21 @@ tiPrim p = case p of
     a <- newTyVar 'a'
     r <- newTyVarWith Row (lacks label) 'r'
     return $ TFun (TRecord $ TRowExtend label a r) (TRecord r)
+  (VariantInject label)  -> do -- ^ dual of record select
+    a <- newTyVar 'a'
+    r <- newTyVarWith Row (lacks label) 'r'
+    return $ TFun a (TVariant $ TRowExtend label a r)
+  (VariantEmbed label)   -> do -- ^ dual of record restrict
+    a <- newTyVar 'a'
+    r <- newTyVarWith Row (lacks label) 'r'
+    return $ TFun (TVariant r) (TVariant $ TRowExtend label a r)
+  (VariantElim label)    -> do
+    a <- newTyVar 'a'
+    b <- newTyVar 'b'
+    r <- newTyVarWith Row (lacks label) 'r'
+    return $ TFun (TRecord $ TRowExtend label a r)
+                  (TFun (TFun a b) (TFun (TFun (TVariant r) b) b))
+
 
 typeInference :: M.Map String Scheme -> Exp -> TI Type
 typeInference env e = do
@@ -295,13 +318,21 @@ e1 = EApp (EApp (EPrim $ RecordExtend "y") (EPrim $ Int 2)) (EPrim RecordEmpty)
 e2 = EApp (EApp (EPrim $ RecordExtend "x") (EPrim $ Int 1)) e1
 e3 = EApp (EPrim $ RecordSelect "y") e2
 e4 = ELet "f" (EAbs "r" (EApp (EPrim $ RecordSelect "x") (EVar "r"))) (EVar "f")
-e5 = (EAbs "r" (EApp (EPrim $ RecordSelect "x") (EVar "r")))
-e6 = (EAbs "r" (EApp (EApp (EPrim Add)
-                               (EApp (EPrim $ RecordSelect "x") (EVar "r")))
-                               (EApp (EPrim $ RecordSelect "y") (EVar "r"))))
+e5 = EAbs "r" (EApp (EPrim $ RecordSelect "x") (EVar "r"))
+e6 = EAbs "r" $ app (EPrim Add) [ EApp (EPrim $ RecordSelect "x") (EVar "r")
+                                , EApp (EPrim $ RecordSelect "y") (EVar "r")]
 
--- -- Row tail unification soundness
--- \r -> if True then { x = 1 | r } else { x = 2 | {} }
+-- Row tail unification soundness
+-- \r -> if True then { x = 1 | r } else { y = 2 | r }
+e7 = EAbs "r" $ app (EPrim Cond)
+       [ EPrim $ Bool True
+       , app (EPrim $ RecordExtend "x") [EPrim $ Int 1, EVar "r"]
+       , app (EPrim $ RecordExtend "y") [EPrim $ Int 2, EVar "r"]
+       ]
+
+app :: Exp -> [Exp] -> Exp
+app f = foldl EApp f
+
 -- -- Fail in empty row case
 -- \x -> case x of A -> 1, B -> 2, A -> 3
 -- -- Fail in row var case
@@ -316,12 +347,12 @@ test :: Exp -> IO ()
 test e = do
   (res,_) <- runTI $ typeInference M.empty e
   case res of
-    Left err -> putStrLn $ "error: " ++ err
+    Left err -> putStrLn $ show e ++ " :: error: " ++ err
     Right t  -> putStrLn $ show e ++ " :: " ++ show (generalise (TypeEnv M.empty) t)
 
 main :: IO ()
 main = do
-  mapM test [ e1, e2, e3, e4, e5, e6 ]
+  mapM test [ e1, e2, e3, e4, e5, e6, e7 ]
   return ()
 
 
@@ -382,10 +413,14 @@ ppPrim :: Prim -> Doc
 ppPrim (Int i)            = integer i
 ppPrim (Bool b)           = if b then "True" else "False"
 ppPrim Add                = "(+)"
+ppPrim Cond               = "(_?_:_)"
+ppPrim RecordEmpty        = "{}"
 ppPrim (RecordSelect l)   = "(_." <> text l <> ")"
 ppPrim (RecordExtend l)   = "{"   <> text l <>  "=_|_}"
 ppPrim (RecordRestrict l) = "(_-" <> text l <> ")"
-ppPrim RecordEmpty        = "{}"
+ppPrim (VariantInject l)  = "<" <> text l <> "=_>"
+ppPrim (VariantEmbed l)   = "<" <> text l <> "|_>"
+ppPrim (VariantElim l)    = "<" <> text l <> "==_?_:_>"
 
 instance Show Scheme where
   showsPrec _ x = shows $ ppScheme x
