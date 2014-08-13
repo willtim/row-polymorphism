@@ -82,6 +82,7 @@ instance Types Type where
   ftv TUnit = S.empty
   ftv TInt = S.empty
   ftv TBool = S.empty
+  ftv TStr = S.empty
   ftv (TFun t1 eff t2) = S.unions [ftv t1, ftv eff, ftv t2]
   ftv TRowEmpty = S.empty
   ftv (TRowExtend l t r) = ftv r `S.union` ftv t
@@ -311,7 +312,8 @@ tiPrim p = case p of
   Total                  -> do
     t1   <- newTyVar 'a'
     eff1 <- newEffectWith (lacks "par")
-    return $ TFun t1 eff1 t1
+    eff2 <- newEffect
+    return $ TFun (TFun TUnit eff1 t1) eff2 t1
   Print                  -> do
     t1   <- newTyVar 'a'
     eff1 <- newEffect
@@ -320,8 +322,8 @@ tiPrim p = case p of
   Pure                   -> do
     t1   <- newTyVar 'a'
     eff1 <- newEffectWith (lacks "io")
-    return $ TFun t1 eff1 t1
-
+    eff2 <- newEffect
+    return $ TFun (TFun TUnit eff1 t1) eff2 t1
 
 typeInference :: M.Map String Scheme -> Exp -> TI (Type, Effect)
 typeInference env e = do
@@ -344,16 +346,19 @@ none = S.empty
 ----------------------------------------------------------------------
 -- Examples
 
+delay e = EAbs "_" e
+
 e1 = ELet "id" (EAbs "x" (EVar "x")) (EVar "id")
 e2 = EAbs "x" (EApp (EApp (EPrim Div) (EPrim $ Int 1)) (EVar "x"))
 e3 = ELet "f" e2 $
        EApp (EApp (EPrim Catch) (EAbs "_" (EApp (EVar "f") (EPrim $ Int 0))))
             (EAbs "_" (EPrim $ Int 0))
 e4 = EAbs "x" (EApp (EApp (EPrim Print) (EPrim $ Str "x is ")) (EVar "x"))
-e5 = ELet "f" e2 (EApp (EPrim Pure) (EApp (EVar "f") (EPrim $ Int 0)))
-e6 = ELet "f" e2 (EApp (EPrim Total) (EApp (EVar "f") (EPrim $ Int 42)))
-e7 = ELet "f" e4 (EApp (EPrim Pure) (EApp (EVar "f") (EPrim $ Int 42)))
+e5 = ELet "f" e2 (EApp (EPrim Pure) (delay (EApp (EVar "f") (EPrim $ Int 0))))
+e6 = ELet "f" e4 (EApp (EPrim Pure) (delay (EApp (EVar "f") (EPrim $ Int 42))))
+e7 = ELet "f" e2 (EApp (EPrim Total) (EApp (EVar "f") (EPrim $ Int 42)))
 e8 = ELet "f" e2 (EApp (EVar "f") (EApp (EVar "f") (EPrim $ Int 0)))
+e9 = EAbs "f" (EApp (EApp (EPrim Print) (EPrim $ Str "argument is pure: ")) (EApp (EPrim Pure) (delay (EApp (EVar "f") (EPrim $ Int 42)))))
 
 test :: Exp -> IO ()
 test e = do
@@ -364,7 +369,7 @@ test e = do
 
 main :: IO ()
 main = do
-  mapM test [ e1, e2, e3, e4, e5, e6, e7, e8 ]
+  mapM test [ e1, e2, e3, e4, e5, e6, e7, e8, e9 ]
   return ()
 
 
@@ -383,8 +388,8 @@ ppType TUnit          = parens empty
 ppType TInt           = "Int"
 ppType TBool          = "Bool"
 ppType TStr           = "String"
-ppType (TFun t eff s) = ppParenType t <+> "->" <+> ppEffect eff <+> ppType s
-ppType _ = error "Unexpected type"
+ppType (TFun t eff s) = ppParenType t <+> "->" <+> ppEffect eff <+> ppParenType s
+ppType eff            = ppEffect eff
 
 ppParenType :: Type -> Doc
 ppParenType t =
