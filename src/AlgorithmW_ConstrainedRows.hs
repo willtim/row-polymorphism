@@ -165,6 +165,7 @@ unify t (TVar v) = varBind v t
 unify TInt TInt = return nullSubst
 unify TBool TBool = return nullSubst
 unify (TRecord row1) (TRecord row2) = unify row1 row2
+unify (TVariant row1) (TVariant row2) = unify row1 row2
 unify TRowEmpty TRowEmpty = return nullSubst
 unify (TRowExtend label1 fieldTy1 rowTail1) row2@TRowExtend{} = do
   (fieldTy2, rowTail2, theta1) <- rewriteRow row2 label1
