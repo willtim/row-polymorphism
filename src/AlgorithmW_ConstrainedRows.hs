@@ -331,6 +331,15 @@ e7 = EAbs "r" $ app (EPrim Cond)
        , app (EPrim $ RecordExtend "y") [EPrim $ Int 2, EVar "r"]
        ]
 
+-- r: {x=1 | {y=2|r}}
+e8 = EAbs "r" $ app (EPrim $ RecordExtend "x")
+     [ EPrim $ Int 1
+     , app (EPrim $ RecordExtend "y")
+         [ EPrim $ Int 2
+         , EVar "r"
+         ]
+     ]
+
 app :: Exp -> [Exp] -> Exp
 app f = foldl EApp f
 
@@ -353,7 +362,7 @@ test e = do
 
 main :: IO ()
 main = do
-  mapM test [ e1, e2, e3, e4, e5, e6, e7 ]
+  mapM test [ e1, e2, e3, e4, e5, e6, e7, e8 ]
   return ()
 
 
