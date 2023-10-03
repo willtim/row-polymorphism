@@ -77,6 +77,7 @@ instance Types Type where
   ftv TBool = S.empty
   ftv (TFun t1 t2) = ftv t1 `S.union` ftv t2
   ftv (TRecord t) = ftv t
+  ftv (TVariant t) = ftv t
   ftv TRowEmpty = S.empty
   ftv (TRowExtend l t r) = ftv r `S.union` ftv t
   apply s (TVar v) = case M.lookup v s of
@@ -84,6 +85,7 @@ instance Types Type where
                        Just t -> t
   apply s (TFun t1 t2) = TFun (apply s t1) (apply s t2)
   apply s (TRecord t) = TRecord (apply s t)
+  apply s (TVariant t) = TVariant (apply s t)
   apply s (TRowExtend l t r) = TRowExtend l (apply s t) (apply s r)
   apply s t = t
 
